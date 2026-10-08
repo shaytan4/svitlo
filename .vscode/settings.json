@@ -1,0 +1,7 @@
+{
+    "java.configuration.updateBuildConfiguration": "automatic",
+    // Flutter project: don't let Java/Gradle extensions import flutter/android
+    // and spawn extra Gradle daemons (they froze the PC by exhausting RAM).
+    "java.import.gradle.enabled": false,
+    "gradle.autoDetect": "off"
+}

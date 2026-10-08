@@ -1,0 +1,28 @@
+*.apk
+TASKS/
+build/
+.idea/
+.gradle/
+local.properties
+.DS_Store
+*.iml
+*.log
+
+# Flutter generated
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+**/android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
+
+# Secrets / signing
+key.properties
+*.keystore
+*.jks
+*.pem
+*.p12
+*.crt
+*.cer
+*.der
+*.key
+*.csr
+*.srl

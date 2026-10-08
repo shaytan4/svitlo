@@ -1,0 +1,84 @@
+name: Release APK
+
+# Push a tag like v1.2.0 to build signed APKs and publish a GitHub Release.
+# Can also be run manually from the Actions tab (builds only, no release).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: flutter
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.41.2"
+          cache: true
+
+      - name: Version from tag
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "BUILD_NAME=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "BUILD_NAME=$(grep '^version:' pubspec.yaml | sed -E 's/version: *([^+]+).*/\1/')" >> "$GITHUB_ENV"
+          fi
+
+      - name: Set up signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [[ -z "$KEYSTORE_BASE64" ]]; then
+            echo "::error::Secret ANDROID_KEYSTORE_BASE64 is not set"; exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          cat > android/key.properties <<PROPS
+          storeFile=$RUNNER_TEMP/release.jks
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=svitlo
+          keyPassword=$KEYSTORE_PASSWORD
+          PROPS
+
+      - run: flutter pub get
+
+      - name: Build APKs
+        run: >
+          flutter build apk --release --split-per-abi
+          --target-platform android-arm,android-arm64
+          --build-name "$BUILD_NAME"
+          --build-number "$GITHUB_RUN_NUMBER"
+
+      - name: Rename APKs
+        run: |
+          mkdir -p ../dist
+          for abi in arm64-v8a armeabi-v7a; do
+            cp "build/app/outputs/flutter-apk/app-$abi-release.apk" "../dist/svitlo-$BUILD_NAME-$abi.apk"
+          done
+          ls -l ../dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: svitlo-apk
+          path: dist/*.apk
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.apk
+          generate_release_notes: true
