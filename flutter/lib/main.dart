@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:html/parser.dart' as html_parser;
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -13,23 +15,70 @@ const String _scheduleUrl =
     'https://www.uz.gov.ua/about/activity/electropostachannia/'
     'electro_consumers/temporary_shutdown/grafikiobmezhen/622296/';
 
-// Light theme palette — inspired by modern iOS tracker apps
-const Color clrBackground = Color(0xFFF2F4FB);
-const Color clrCard       = Color(0xFFFFFFFF);
-const Color clrPrimary    = Color(0xFF6C5ECF); // violet
-const Color clrPrimaryBg  = Color(0xFFEEEAFB); // light violet tint
-const Color clrGreen      = Color(0xFF34C77B);
-const Color clrGreenBg    = Color(0xFFE8F9F0);
-const Color clrRed        = Color(0xFFF05C5C);
-const Color clrRedBg      = Color(0xFFFFECEC);
-const Color clrText       = Color(0xFF1A1640);
-const Color clrSubtext    = Color(0xFF9491B4);
-const Color clrBorder     = Color(0xFFE8E8F0);
-// legacy aliases (kept for any remaining refs)
-const Color clrForeground = clrText;
-const Color clrButton     = clrPrimaryBg;
-const Color clrInputBg    = clrPrimaryBg;
-const Color clrGray       = clrSubtext;
+const String _releasesApi =
+    'https://api.github.com/repos/shaytan4/svitlo/releases/latest';
+
+const MethodChannel _updater = MethodChannel('svitlo/updater');
+
+// ─── Palette ──────────────────────────────────────────────────────────────────
+
+class AppColors extends ThemeExtension<AppColors> {
+  final Color background, card, primary, primaryBg, green, greenBg, red, redBg,
+      text, subtext, border;
+
+  const AppColors({
+    required this.background,
+    required this.card,
+    required this.primary,
+    required this.primaryBg,
+    required this.green,
+    required this.greenBg,
+    required this.red,
+    required this.redBg,
+    required this.text,
+    required this.subtext,
+    required this.border,
+  });
+
+  // Light theme palette — inspired by modern iOS tracker apps
+  static const light = AppColors(
+    background: Color(0xFFF2F4FB),
+    card: Color(0xFFFFFFFF),
+    primary: Color(0xFF6C5ECF), // violet
+    primaryBg: Color(0xFFEEEAFB), // light violet tint
+    green: Color(0xFF34C77B),
+    greenBg: Color(0xFFE8F9F0),
+    red: Color(0xFFF05C5C),
+    redBg: Color(0xFFFFECEC),
+    text: Color(0xFF1A1640),
+    subtext: Color(0xFF9491B4),
+    border: Color(0xFFE8E8F0),
+  );
+
+  static const dark = AppColors(
+    background: Color(0xFF12111F),
+    card: Color(0xFF1E1C33),
+    primary: Color(0xFF9F8FEF),
+    primaryBg: Color(0xFF2C2850),
+    green: Color(0xFF3DD68C),
+    greenBg: Color(0xFF16322A),
+    red: Color(0xFFF26B6B),
+    redBg: Color(0xFF3A1F27),
+    text: Color(0xFFECEAF8),
+    subtext: Color(0xFF8F8CB0),
+    border: Color(0xFF2E2B48),
+  );
+
+  static AppColors of(BuildContext context) =>
+      Theme.of(context).extension<AppColors>()!;
+
+  @override
+  AppColors copyWith() => this;
+
+  @override
+  AppColors lerp(covariant AppColors? other, double t) =>
+      t < 0.5 ? this : (other ?? this);
+}
 
 // ─── Data types ───────────────────────────────────────────────────────────────
 
@@ -213,10 +262,124 @@ String formatDuration(int seconds) {
       '${s.toString().padLeft(2, '0')}';
 }
 
+// ─── Updates (GitHub Releases) ────────────────────────────────────────────────
+
+class ReleaseInfo {
+  final String version;
+  final String apkUrl;
+  const ReleaseInfo({required this.version, required this.apkUrl});
+}
+
+/// True if [latest] ("1.2.10") is a higher version than [current] ("1.2.9").
+bool isNewerVersion(String latest, String current) {
+  List<int> parts(String v) => v
+      .split('+')
+      .first
+      .split('.')
+      .map((p) => int.tryParse(p) ?? 0)
+      .toList();
+  final a = parts(latest), b = parts(current);
+  for (int i = 0; i < a.length || i < b.length; i++) {
+    final x = i < a.length ? a[i] : 0;
+    final y = i < b.length ? b[i] : 0;
+    if (x != y) return x > y;
+  }
+  return false;
+}
+
+/// Latest release and its APK for the first matching device ABI.
+Future<ReleaseInfo> fetchLatestRelease(List<String> abis) async {
+  final resp = await http.get(Uri.parse(_releasesApi),
+      headers: {'Accept': 'application/vnd.github+json'});
+  if (resp.statusCode != 200) {
+    throw Exception('HTTP error: ${resp.statusCode}');
+  }
+  final json = jsonDecode(resp.body) as Map<String, dynamic>;
+  final version = (json['tag_name'] as String).replaceFirst(RegExp('^v'), '');
+  final assets = (json['assets'] as List).cast<Map<String, dynamic>>();
+  for (final abi in abis) {
+    for (final a in assets) {
+      if ((a['name'] as String).endsWith('-$abi.apk')) {
+        return ReleaseInfo(
+            version: version, apkUrl: a['browser_download_url'] as String);
+      }
+    }
+  }
+  throw Exception('У релізі $version немає APK для цього пристрою');
+}
+
+/// Downloads [url] to [path], reporting progress 0..1 (null if size unknown).
+Future<void> downloadFile(
+    String url, String path, void Function(double?) onProgress) async {
+  final client = http.Client();
+  try {
+    final resp = await client.send(http.Request('GET', Uri.parse(url)));
+    if (resp.statusCode != 200) {
+      throw Exception('HTTP error: ${resp.statusCode}');
+    }
+    final file = File(path);
+    await file.parent.create(recursive: true);
+    final sink = file.openWrite();
+    final total = resp.contentLength;
+    int received = 0;
+    try {
+      await for (final chunk in resp.stream) {
+        sink.add(chunk);
+        received += chunk.length;
+        onProgress(total != null && total > 0 ? received / total : null);
+      }
+    } finally {
+      await sink.close();
+    }
+  } finally {
+    client.close();
+  }
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
-void main() {
+const String _prefsDarkKey = 'darkTheme';
+
+/// Current theme; changed from the settings tab and saved to prefs.
+final ValueNotifier<ThemeMode> themeMode = ValueNotifier(ThemeMode.light);
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final prefs = await SharedPreferences.getInstance();
+  if (prefs.getBool(_prefsDarkKey) ?? false) themeMode.value = ThemeMode.dark;
   runApp(const SvitloApp());
+}
+
+void setDarkTheme(bool dark) {
+  themeMode.value = dark ? ThemeMode.dark : ThemeMode.light;
+  SharedPreferences.getInstance()
+      .then((prefs) => prefs.setBool(_prefsDarkKey, dark));
+}
+
+ThemeData _buildTheme(AppColors c, Brightness brightness) {
+  return ThemeData(
+    brightness: brightness,
+    scaffoldBackgroundColor: c.background,
+    colorScheme: brightness == Brightness.dark
+        ? ColorScheme.dark(
+            surface: c.background, primary: c.primary, secondary: c.green)
+        : ColorScheme.light(
+            surface: c.background, primary: c.primary, secondary: c.green),
+    cardColor: c.card,
+    extensions: [c],
+    textTheme: TextTheme(
+      bodyMedium: TextStyle(color: c.text, fontSize: 16),
+    ),
+    elevatedButtonTheme: ElevatedButtonThemeData(
+      style: ElevatedButton.styleFrom(
+        backgroundColor: c.primary,
+        foregroundColor: Color(0xFFFFFFFF),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.all(Radius.circular(14)),
+        ),
+      ),
+    ),
+  );
 }
 
 class SvitloApp extends StatelessWidget {
@@ -224,32 +387,16 @@ class SvitloApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: '⚡ Svitlo',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        brightness: Brightness.light,
-        scaffoldBackgroundColor: clrBackground,
-        colorScheme: const ColorScheme.light(
-          surface: clrBackground,
-          primary: clrPrimary,
-          secondary: clrGreen,
-        ),
-        cardColor: clrCard,
-        textTheme: const TextTheme(
-          bodyMedium: TextStyle(color: clrText, fontSize: 16),
-        ),
-        elevatedButtonTheme: ElevatedButtonThemeData(
-          style: ElevatedButton.styleFrom(
-            backgroundColor: clrPrimary,
-            foregroundColor: Color(0xFFFFFFFF),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.all(Radius.circular(14)),
-            ),
-          ),
-        ),
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: themeMode,
+      builder: (context, mode, child) => MaterialApp(
+        title: '⚡ Svitlo',
+        debugShowCheckedModeBanner: false,
+        theme: _buildTheme(AppColors.light, Brightness.light),
+        darkTheme: _buildTheme(AppColors.dark, Brightness.dark),
+        themeMode: mode,
+        home: const HomePage(),
       ),
-      home: const HomePage(),
     );
   }
 }
@@ -283,11 +430,100 @@ class _HomePageState extends State<HomePage> {
 
   Timer? _ticker;
 
+  // Update state
+  String? _appVersion;
+  List<String> _abis = [];
+  String _cacheDir = '';
+  bool _checkingUpdate = false;
+  bool _downloading = false;
+  double? _downloadProgress;
+
+  AppColors get c => AppColors.of(context);
+
   @override
   void initState() {
     super.initState();
     _startTicker();
     _restoreQueue().then((_) => _load());
+    _loadAppInfo();
+  }
+
+  Future<void> _loadAppInfo() async {
+    try {
+      final info = await _updater.invokeMapMethod<String, dynamic>('appInfo');
+      if (info == null || !mounted) return;
+      setState(() {
+        _appVersion = info['version'] as String?;
+        _abis = (info['abis'] as List).cast<String>();
+        _cacheDir = info['cacheDir'] as String;
+      });
+    } on MissingPluginException {
+      // Not Android — no version info / updates.
+    }
+  }
+
+  void _showSnack(String text) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  Future<void> _checkUpdate() async {
+    final current = _appVersion;
+    if (current == null || _checkingUpdate || _downloading) return;
+    setState(() => _checkingUpdate = true);
+    ReleaseInfo release;
+    try {
+      release = await fetchLatestRelease(_abis);
+    } catch (err) {
+      if (!mounted) return;
+      setState(() => _checkingUpdate = false);
+      _showSnack(isNetworkError(err)
+          ? '❌ Немає підключення до інтернету'
+          : '❌ Не вдалося перевірити оновлення: $err');
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _checkingUpdate = false);
+
+    if (!isNewerVersion(release.version, current)) {
+      _showSnack('У вас остання версія ($current)');
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Доступна версія ${release.version}'),
+        content: Text('Поточна версія: $current.\n'
+            'Завантажити та встановити оновлення?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Пізніше'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Оновити'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() {
+      _downloading = true;
+      _downloadProgress = 0;
+    });
+    try {
+      final path = '$_cacheDir/updates/svitlo-${release.version}.apk';
+      await downloadFile(release.apkUrl, path, (p) {
+        if (mounted) setState(() => _downloadProgress = p);
+      });
+      await _updater.invokeMethod('installApk', {'path': path});
+    } catch (err) {
+      if (mounted) _showSnack('❌ Не вдалося завантажити оновлення: $err');
+    } finally {
+      if (mounted) setState(() => _downloading = false);
+    }
   }
 
   Future<void> _restoreQueue() async {
@@ -385,33 +621,38 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: clrBackground,
-      extendBody: true,
-      body: SafeArea(
-        bottom: false,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            _buildHeader(),
-            ...switch (_tab) {
-              _Tab.today => [
-                  _buildCountdownCard(),
-                  _buildStatusBar(),
-                  Expanded(child: _buildScheduleList()),
-                ],
-              _Tab.tomorrow => [
-                  _buildStatusBar(),
-                  Expanded(child: _buildTomorrowList()),
-                ],
-              _Tab.settings => [
-                  Expanded(child: _buildSettings()),
-                ],
-            },
-          ],
+    // Status bar icons must contrast with the background in both themes.
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: dark ? SystemUiOverlayStyle.light : SystemUiOverlayStyle.dark,
+      child: Scaffold(
+        backgroundColor: c.background,
+        extendBody: true,
+        body: SafeArea(
+          bottom: false,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _buildHeader(),
+              ...switch (_tab) {
+                _Tab.today => [
+                    _buildCountdownCard(),
+                    _buildStatusBar(),
+                    Expanded(child: _buildScheduleList()),
+                  ],
+                _Tab.tomorrow => [
+                    _buildStatusBar(),
+                    Expanded(child: _buildTomorrowList()),
+                  ],
+                _Tab.settings => [
+                    Expanded(child: _buildSettings()),
+                  ],
+              },
+            ],
+          ),
         ),
+        bottomNavigationBar: _buildBottomBar(),
       ),
-      bottomNavigationBar: _buildBottomBar(),
     );
   }
 
@@ -424,7 +665,7 @@ class _HomePageState extends State<HomePage> {
         margin: const EdgeInsets.fromLTRB(16, 0, 16, 12),
         padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
         decoration: BoxDecoration(
-          color: clrCard,
+          color: c.card,
           borderRadius: BorderRadius.circular(24),
           boxShadow: [
             BoxShadow(
@@ -451,7 +692,7 @@ class _HomePageState extends State<HomePage> {
 
   Widget _bottomItem(
       IconData icon, String label, bool selected, VoidCallback onTap) {
-    final color = selected ? clrPrimary : clrSubtext;
+    final color = selected ? c.primary : c.subtext;
     return Expanded(
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
@@ -460,7 +701,7 @@ class _HomePageState extends State<HomePage> {
           duration: const Duration(milliseconds: 200),
           padding: const EdgeInsets.symmetric(vertical: 8),
           decoration: BoxDecoration(
-            color: selected ? clrPrimaryBg : Color(0x00000000),
+            color: selected ? c.primaryBg : Color(0x00000000),
             borderRadius: BorderRadius.circular(18),
           ),
           child: Column(
@@ -575,57 +816,119 @@ class _HomePageState extends State<HomePage> {
 
   Widget _buildSettings() {
     final options = {..._queues, _selectedQueue}.toList()..sort();
+    final dark = themeMode.value == ThemeMode.dark;
     return SingleChildScrollView(
       padding: EdgeInsets.fromLTRB(
           16, 14, 16, 16 + MediaQuery.paddingOf(context).bottom),
-      child: Container(
-        padding: const EdgeInsets.all(18),
-        decoration: BoxDecoration(
-          color: clrCard,
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: clrBorder, width: 1),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Оберіть групу',
-              style: TextStyle(
-                color: clrText,
-                fontSize: 16,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-            const SizedBox(height: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _settingsCard('Оберіть групу', [
             Wrap(
               spacing: 8,
               runSpacing: 8,
-              children: options.map((q) {
-                final isSelected = q == _selectedQueue;
-                return GestureDetector(
-                  onTap: () => _selectQueue(q),
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 200),
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: isSelected ? clrPrimary : clrPrimaryBg,
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Text(
-                      q,
-                      style: TextStyle(
-                        color: isSelected ? Color(0xFFFFFFFF) : clrPrimary,
-                        fontWeight:
-                            isSelected ? FontWeight.w700 : FontWeight.w500,
-                        fontSize: 13,
-                      ),
-                    ),
-                  ),
-                );
-              }).toList(),
+              children: options
+                  .map((q) =>
+                      _chip(q, q == _selectedQueue, () => _selectQueue(q)))
+                  .toList(),
             ),
-          ],
+          ]),
+          const SizedBox(height: 12),
+          _settingsCard('Тема', [
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _chip('☀️ Світла', !dark, () => setDarkTheme(false)),
+                _chip('🌙 Темна', dark, () => setDarkTheme(true)),
+              ],
+            ),
+          ]),
+          const SizedBox(height: 12),
+          _settingsCard('Оновлення', [
+            Text(
+              'Поточна версія: ${_appVersion ?? '—'}',
+              style: TextStyle(color: c.subtext, fontSize: 14),
+            ),
+            const SizedBox(height: 12),
+            if (_downloading) ...[
+              LinearProgressIndicator(
+                value: _downloadProgress,
+                color: c.primary,
+                backgroundColor: c.primaryBg,
+                borderRadius: BorderRadius.circular(4),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                _downloadProgress == null
+                    ? 'Завантаження...'
+                    : 'Завантаження ${(_downloadProgress! * 100).round()}%',
+                style: TextStyle(color: c.subtext, fontSize: 12),
+              ),
+            ] else
+              ElevatedButton.icon(
+                onPressed: _appVersion == null || _checkingUpdate
+                    ? null
+                    : _checkUpdate,
+                icon: _checkingUpdate
+                    ? SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                            color: c.primary, strokeWidth: 2),
+                      )
+                    : const Icon(Icons.system_update_rounded),
+                label: const Text('Перевірити оновлення'),
+              ),
+          ]),
+        ],
+      ),
+    );
+  }
+
+  Widget _settingsCard(String title, List<Widget> children) {
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: c.card,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: c.border, width: 1),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(
+            title,
+            style: TextStyle(
+              color: c.text,
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 12),
+          ...children,
+        ],
+      ),
+    );
+  }
+
+  Widget _chip(String label, bool isSelected, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        decoration: BoxDecoration(
+          color: isSelected ? c.primary : c.primaryBg,
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: isSelected ? Color(0xFFFFFFFF) : c.primary,
+            fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
+            fontSize: 13,
+          ),
         ),
       ),
     );
@@ -650,7 +953,7 @@ class _HomePageState extends State<HomePage> {
       key: const ValueKey('empty'),
       height: 110,
       decoration: BoxDecoration(
-        color: clrCard,
+        color: c.card,
         borderRadius: BorderRadius.circular(20),
         boxShadow: [
           BoxShadow(
@@ -662,21 +965,21 @@ class _HomePageState extends State<HomePage> {
       ),
       child: Center(
         child: _loading
-            ? const SizedBox(
+            ? SizedBox(
                 width: 28,
                 height: 28,
                 child: CircularProgressIndicator(
-                    color: clrPrimary, strokeWidth: 2.5))
+                    color: c.primary, strokeWidth: 2.5))
             : Text('—',
-                style: TextStyle(color: clrSubtext, fontSize: 36)),
+                style: TextStyle(color: c.subtext, fontSize: 36)),
       ),
     );
   }
 
   Widget _countdownActive(PowerStatus status, int remaining) {
     final isLight = status == PowerStatus.light;
-    final accent = isLight ? clrGreen : clrRed;
-    final bgColor = isLight ? clrGreenBg : clrRedBg;
+    final accent = isLight ? c.green : c.red;
+    final bgColor = isLight ? c.greenBg : c.redBg;
     final label = isLight ? 'Є світло ще' : 'Відключення ще';
     final icon = isLight ? '💡' : '🚫';
 
@@ -760,7 +1063,7 @@ class _HomePageState extends State<HomePage> {
       padding: const EdgeInsets.fromLTRB(20, 8, 20, 4),
       child: Text(
         _statusText,
-        style: const TextStyle(color: clrSubtext, fontSize: 11),
+        style: TextStyle(color: c.subtext, fontSize: 11),
         textAlign: TextAlign.center,
       ),
     );
@@ -783,7 +1086,7 @@ class _HomePageState extends State<HomePage> {
           child: Text(
             'Розклад відключень',
             style: TextStyle(
-              color: clrText,
+              color: c.text,
               fontSize: 16,
               fontWeight: FontWeight.w700,
             ),
@@ -806,12 +1109,12 @@ class _HomePageState extends State<HomePage> {
     }
 
     if (_tomorrowRows.isEmpty) {
-      return const Padding(
+      return Padding(
         padding: EdgeInsets.fromLTRB(20, 40, 20, 0),
         child: Text(
           'Графік на завтра ще не опубліковано',
           textAlign: TextAlign.center,
-          style: TextStyle(color: clrSubtext, fontSize: 15),
+          style: TextStyle(color: c.subtext, fontSize: 15),
         ),
       );
     }
@@ -824,7 +1127,7 @@ class _HomePageState extends State<HomePage> {
           child: Text(
             'Розклад на завтра',
             style: TextStyle(
-              color: clrText,
+              color: c.text,
               fontSize: 16,
               fontWeight: FontWeight.w700,
             ),
@@ -935,8 +1238,9 @@ class _TimeCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = AppColors.of(context);
     final isLight = status == PowerStatus.light;
-    final accent = isLight ? clrGreen : clrRed;
+    final accent = isLight ? c.green : c.red;
     final statusText = isLight ? 'Є світло' : 'Відключення';
     final statusIcon = isLight ? '💡' : '🚫';
 
@@ -946,12 +1250,12 @@ class _TimeCard extends StatelessWidget {
         height: 68,
         decoration: BoxDecoration(
           color: isCurrent
-              ? (isLight ? clrGreenBg : clrRedBg)
-              : clrCard,
+              ? (isLight ? c.greenBg : c.redBg)
+              : c.card,
           borderRadius: BorderRadius.circular(16),
           border: isCurrent
               ? Border.all(color: accent.withAlpha(100), width: 1.5)
-              : Border.all(color: clrBorder, width: 1),
+              : Border.all(color: c.border, width: 1),
           boxShadow: isCurrent
               ? [
                   BoxShadow(
@@ -989,7 +1293,7 @@ class _TimeCard extends StatelessWidget {
               child: Text(
                 hours,
                 style: TextStyle(
-                  color: clrText,
+                  color: c.text,
                   fontSize: 14,
                   fontWeight: FontWeight.w600,
                 ),
