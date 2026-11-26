@@ -168,7 +168,8 @@ Future<List<List<ScheduleRow>>> parseUZSchedule() async {
     }
 
     if (result.isEmpty) {
-      throw Exception('Не вдалося знайти таблицю з розкладом відключень');
+      throw Exception(tr('Не вдалося знайти таблицю з розкладом відключень',
+          'Не удалось найти таблицу с графиком отключений'));
     }
 
     return result;
@@ -231,6 +232,31 @@ PowerStatus slotStatus(String selected, List<String> queues) {
     }
   }
   return (status: PowerStatus.light, remainingSec: 0, found: false);
+}
+
+/// Merges adjacent slots (end of one == start of next) that have the same
+/// status for [selected] into a single slot.
+List<ScheduleRow> groupRows(String selected, List<ScheduleRow> rows) {
+  final result = <ScheduleRow>[];
+  for (final row in rows) {
+    if (result.isNotEmpty) {
+      final prev = result.last;
+      final a = parseHourRange(prev.hours);
+      final b = parseHourRange(row.hours);
+      if (a != null &&
+          b != null &&
+          a.$2 == b.$1 &&
+          slotStatus(selected, prev.queues) ==
+              slotStatus(selected, row.queues)) {
+        final start = prev.hours.trim().split(RegExp(r'\s+')).first;
+        final end = row.hours.trim().split(RegExp(r'\s+')).last;
+        result.last = ScheduleRow(hours: '$start $end', queues: prev.queues);
+        continue;
+      }
+    }
+    result.add(row);
+  }
+  return result;
 }
 
 List<String> collectQueues(List<ScheduleRow> rows) {
@@ -305,7 +331,8 @@ Future<ReleaseInfo> fetchLatestRelease(List<String> abis) async {
       }
     }
   }
-  throw Exception('У релізі $version немає APK для цього пристрою');
+  throw Exception(tr('У релізі $version немає APK для цього пристрою',
+      'В релизе $version нет APK для этого устройства'));
 }
 
 /// Downloads [url] to [path], reporting progress 0..1 (null if size unknown).
@@ -339,14 +366,26 @@ Future<void> downloadFile(
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 const String _prefsDarkKey = 'darkTheme';
+const String _prefsLangKey = 'language';
 
 /// Current theme; changed from the settings tab and saved to prefs.
 final ValueNotifier<ThemeMode> themeMode = ValueNotifier(ThemeMode.light);
+
+enum AppLang { uk, ru }
+
+/// Current UI language; changed from the settings tab and saved to prefs.
+final ValueNotifier<AppLang> appLang = ValueNotifier(AppLang.uk);
+
+/// Picks the string for the current language.
+String tr(String uk, String ru) => appLang.value == AppLang.ru ? ru : uk;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final prefs = await SharedPreferences.getInstance();
   if (prefs.getBool(_prefsDarkKey) ?? false) themeMode.value = ThemeMode.dark;
+  if (prefs.getString(_prefsLangKey) == AppLang.ru.name) {
+    appLang.value = AppLang.ru;
+  }
   runApp(const SvitloApp());
 }
 
@@ -354,6 +393,12 @@ void setDarkTheme(bool dark) {
   themeMode.value = dark ? ThemeMode.dark : ThemeMode.light;
   SharedPreferences.getInstance()
       .then((prefs) => prefs.setBool(_prefsDarkKey, dark));
+}
+
+void setLanguage(AppLang lang) {
+  appLang.value = lang;
+  SharedPreferences.getInstance()
+      .then((prefs) => prefs.setString(_prefsLangKey, lang.name));
 }
 
 ThemeData _buildTheme(AppColors c, Brightness brightness) {
@@ -414,13 +459,16 @@ enum _Tab { today, tomorrow, settings }
 
 class _HomePageState extends State<HomePage> {
   static const String _prefsQueueKey = 'selectedQueue';
+  static const String _prefsGroupKey = 'groupSlots';
 
   List<ScheduleRow> _rows = [];
   List<ScheduleRow> _tomorrowRows = [];
   List<String> _queues = [];
   String _selectedQueue = '1(1,2)';
-  String _statusText = '';
+  String _updatedTime = '';
+  Object? _loadError;
   bool _loading = false;
+  bool _groupSlots = false;
   _Tab _tab = _Tab.today;
 
   // Countdown state
@@ -443,6 +491,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    appLang.addListener(_onLangChanged);
     _startTicker();
     _restoreQueue().then((_) => _load());
     _loadAppInfo();
@@ -477,32 +526,39 @@ class _HomePageState extends State<HomePage> {
       if (!mounted) return;
       setState(() => _checkingUpdate = false);
       _showSnack(isNetworkError(err)
-          ? '❌ Немає підключення до інтернету'
-          : '❌ Не вдалося перевірити оновлення: $err');
+          ? tr('❌ Немає підключення до інтернету',
+              '❌ Нет подключения к интернету')
+          : tr('❌ Не вдалося перевірити оновлення: $err',
+              '❌ Не удалось проверить обновления: $err'));
       return;
     }
     if (!mounted) return;
     setState(() => _checkingUpdate = false);
 
     if (!isNewerVersion(release.version, current)) {
-      _showSnack('У вас остання версія ($current)');
+      _showSnack(tr('У вас остання версія ($current)',
+          'У вас последняя версия ($current)'));
       return;
     }
 
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text('Доступна версія ${release.version}'),
-        content: Text('Поточна версія: $current.\n'
-            'Завантажити та встановити оновлення?'),
+        title: Text(tr('Доступна версія ${release.version}',
+            'Доступна версия ${release.version}')),
+        content: Text(tr(
+            'Поточна версія: $current.\n'
+                'Завантажити та встановити оновлення?',
+            'Текущая версия: $current.\n'
+                'Скачать и установить обновление?')),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Пізніше'),
+            child: Text(tr('Пізніше', 'Позже')),
           ),
           TextButton(
             onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Оновити'),
+            child: Text(tr('Оновити', 'Обновить')),
           ),
         ],
       ),
@@ -520,7 +576,8 @@ class _HomePageState extends State<HomePage> {
       });
       await _updater.invokeMethod('installApk', {'path': path});
     } catch (err) {
-      if (mounted) _showSnack('❌ Не вдалося завантажити оновлення: $err');
+      if (mounted) _showSnack(tr('❌ Не вдалося завантажити оновлення: $err',
+          '❌ Не удалось скачать обновление: $err'));
     } finally {
       if (mounted) setState(() => _downloading = false);
     }
@@ -529,20 +586,57 @@ class _HomePageState extends State<HomePage> {
   Future<void> _restoreQueue() async {
     final prefs = await SharedPreferences.getInstance();
     final saved = prefs.getString(_prefsQueueKey);
-    if (saved != null && mounted) setState(() => _selectedQueue = saved);
+    final group = prefs.getBool(_prefsGroupKey) ?? false;
+    if (!mounted) return;
+    setState(() {
+      if (saved != null) _selectedQueue = saved;
+      _groupSlots = group;
+    });
+  }
+
+  /// Rows as shown: merged into blocks when grouping is on.
+  List<ScheduleRow> _view(List<ScheduleRow> rows) =>
+      _groupSlots ? groupRows(_selectedQueue, rows) : rows;
+
+  void _setGroupSlots(bool value) {
+    setState(() {
+      _groupSlots = value;
+      final info = currentSlotInfo(_selectedQueue, _view(_rows));
+      _countdownFound = info.found;
+      _countdownStatus = info.found ? info.status : null;
+      _remainingSec = info.remainingSec;
+    });
+    SharedPreferences.getInstance()
+        .then((prefs) => prefs.setBool(_prefsGroupKey, value));
   }
 
   @override
   void dispose() {
+    appLang.removeListener(_onLangChanged);
     _ticker?.cancel();
     super.dispose();
+  }
+
+  void _onLangChanged() => setState(() {});
+
+  String get _statusText {
+    if (_loading) return tr('Завантаження...', 'Загрузка...');
+    final err = _loadError;
+    if (err != null) {
+      return isNetworkError(err)
+          ? tr('❌ Немає підключення до інтернету',
+              '❌ Нет подключения к интернету')
+          : tr('❌ Помилка: $err', '❌ Ошибка: $err');
+    }
+    if (_updatedTime.isEmpty) return '';
+    return tr('Оновлено: $_updatedTime', 'Обновлено: $_updatedTime');
   }
 
   void _startTicker() {
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted) return;
       if (_rows.isEmpty) return;
-      final info = currentSlotInfo(_selectedQueue, _rows);
+      final info = currentSlotInfo(_selectedQueue, _view(_rows));
       setState(() {
         _countdownFound = info.found;
         _countdownStatus = info.found ? info.status : null;
@@ -555,7 +649,7 @@ class _HomePageState extends State<HomePage> {
     if (_loading) return;
     setState(() {
       _loading = true;
-      _statusText = 'Завантаження...';
+      _loadError = null;
       _rows = [];
       _tomorrowRows = [];
       _countdownFound = false;
@@ -567,14 +661,14 @@ class _HomePageState extends State<HomePage> {
       final tomorrowRows = tables.length > 1 ? tables[1] : <ScheduleRow>[];
       final queues = collectQueues([...rows, ...tomorrowRows]);
 
-      final info = currentSlotInfo(_selectedQueue, rows);
+      final info = currentSlotInfo(_selectedQueue, _view(rows));
 
       if (!mounted) return;
       setState(() {
         _rows = rows;
         _tomorrowRows = tomorrowRows;
         _queues = queues;
-        _statusText = 'Оновлено: ${_nowTime()}';
+        _updatedTime = _nowTime();
         _loading = false;
         _countdownFound = info.found;
         _countdownStatus = info.found ? info.status : null;
@@ -584,9 +678,7 @@ class _HomePageState extends State<HomePage> {
       if (!mounted) return;
       setState(() {
         _loading = false;
-        _statusText = isNetworkError(err)
-            ? '❌ No internet connection'
-            : '❌ Помилка: $err';
+        _loadError = err;
       });
     }
   }
@@ -600,7 +692,7 @@ class _HomePageState extends State<HomePage> {
   void _selectQueue(String q) {
     setState(() {
       _selectedQueue = q;
-      final info = currentSlotInfo(q, _rows);
+      final info = currentSlotInfo(q, _view(_rows));
       _countdownFound = info.found;
       _countdownStatus = info.found ? info.status : null;
       _remainingSec = info.remainingSec;
@@ -614,7 +706,9 @@ class _HomePageState extends State<HomePage> {
         mode: LaunchMode.externalApplication);
     if (!ok && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Не вдалося відкрити сайт')),
+        SnackBar(
+            content: Text(
+                tr('Не вдалося відкрити сайт', 'Не удалось открыть сайт'))),
       );
     }
   }
@@ -677,11 +771,11 @@ class _HomePageState extends State<HomePage> {
         ),
         child: Row(
           children: [
-            _bottomItem(Icons.today_rounded, 'Сьогодні',
+            _bottomItem(Icons.today_rounded, tr('Сьогодні', 'Сегодня'),
                 _tab == _Tab.today, () => setState(() => _tab = _Tab.today)),
             _bottomItem(Icons.event_rounded, 'Завтра',
                 _tab == _Tab.tomorrow, () => setState(() => _tab = _Tab.tomorrow)),
-            _bottomItem(Icons.tune_rounded, 'Налаштування',
+            _bottomItem(Icons.tune_rounded, tr('Налаштування', 'Настройки'),
                 _tab == _Tab.settings, () => setState(() => _tab = _Tab.settings)),
             _bottomItem(Icons.open_in_new_rounded, 'Сайт', false, _openSite),
           ],
@@ -798,7 +892,7 @@ class _HomePageState extends State<HomePage> {
                 borderRadius: BorderRadius.circular(20),
               ),
               child: Text(
-                'Група $_selectedQueue',
+                tr('Група $_selectedQueue', 'Группа $_selectedQueue'),
                 style: const TextStyle(
                   color: Color(0xFFFFFFFF),
                   fontSize: 13,
@@ -817,13 +911,14 @@ class _HomePageState extends State<HomePage> {
   Widget _buildSettings() {
     final options = {..._queues, _selectedQueue}.toList()..sort();
     final dark = themeMode.value == ThemeMode.dark;
+    final ru = appLang.value == AppLang.ru;
     return SingleChildScrollView(
       padding: EdgeInsets.fromLTRB(
           16, 14, 16, 16 + MediaQuery.paddingOf(context).bottom),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _settingsCard('Оберіть групу', [
+          _settingsCard(tr('Оберіть групу', 'Выберите группу'), [
             Wrap(
               spacing: 8,
               runSpacing: 8,
@@ -834,20 +929,47 @@ class _HomePageState extends State<HomePage> {
             ),
           ]),
           const SizedBox(height: 12),
+          _settingsCard(tr('Групувати час', 'Группировать время'), [
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _chip(tr('Увімк.', 'Вкл.'), _groupSlots,
+                    () => _setGroupSlots(true)),
+                _chip(tr('Вимк.', 'Выкл.'), !_groupSlots,
+                    () => _setGroupSlots(false)),
+              ],
+            ),
+          ]),
+          const SizedBox(height: 12),
           _settingsCard('Тема', [
             Wrap(
               spacing: 8,
               runSpacing: 8,
               children: [
-                _chip('☀️ Світла', !dark, () => setDarkTheme(false)),
-                _chip('🌙 Темна', dark, () => setDarkTheme(true)),
+                _chip(tr('☀️ Світла', '☀️ Светлая'), !dark,
+                    () => setDarkTheme(false)),
+                _chip(tr('🌙 Темна', '🌙 Тёмная'), dark,
+                    () => setDarkTheme(true)),
               ],
             ),
           ]),
           const SizedBox(height: 12),
-          _settingsCard('Оновлення', [
+          _settingsCard(tr('Мова', 'Язык'), [
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _chip('УКР', !ru, () => setLanguage(AppLang.uk)),
+                _chip('РУ', ru, () => setLanguage(AppLang.ru)),
+              ],
+            ),
+          ]),
+          const SizedBox(height: 12),
+          _settingsCard(tr('Оновлення', 'Обновления'), [
             Text(
-              'Поточна версія: ${_appVersion ?? '—'}',
+              tr('Поточна версія: ${_appVersion ?? '—'}',
+                  'Текущая версия: ${_appVersion ?? '—'}'),
               style: TextStyle(color: c.subtext, fontSize: 14),
             ),
             const SizedBox(height: 12),
@@ -861,8 +983,9 @@ class _HomePageState extends State<HomePage> {
               const SizedBox(height: 6),
               Text(
                 _downloadProgress == null
-                    ? 'Завантаження...'
-                    : 'Завантаження ${(_downloadProgress! * 100).round()}%',
+                    ? tr('Завантаження...', 'Загрузка...')
+                    : tr('Завантаження ${(_downloadProgress! * 100).round()}%',
+                        'Загрузка ${(_downloadProgress! * 100).round()}%'),
                 style: TextStyle(color: c.subtext, fontSize: 12),
               ),
             ] else
@@ -878,7 +1001,7 @@ class _HomePageState extends State<HomePage> {
                             color: c.primary, strokeWidth: 2),
                       )
                     : const Icon(Icons.system_update_rounded),
-                label: const Text('Перевірити оновлення'),
+                label: Text(tr('Перевірити оновлення', 'Проверить обновления')),
               ),
           ]),
         ],
@@ -980,7 +1103,9 @@ class _HomePageState extends State<HomePage> {
     final isLight = status == PowerStatus.light;
     final accent = isLight ? c.green : c.red;
     final bgColor = isLight ? c.greenBg : c.redBg;
-    final label = isLight ? 'Є світло ще' : 'Відключення ще';
+    final label = isLight
+        ? tr('Є світло ще', 'Свет есть ещё')
+        : tr('Відключення ще', 'Отключение ещё');
     final icon = isLight ? '💡' : '🚫';
 
     return Container(
@@ -1076,7 +1201,8 @@ class _HomePageState extends State<HomePage> {
       return const SizedBox.shrink();
     }
 
-    final currentIdx = _rows.indexWhere((r) => isCurrentTimeInRange(r.hours));
+    final rows = _view(_rows);
+    final currentIdx = rows.indexWhere((r) => isCurrentTimeInRange(r.hours));
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1084,7 +1210,7 @@ class _HomePageState extends State<HomePage> {
         Padding(
           padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
           child: Text(
-            'Розклад відключень',
+            tr('Розклад відключень', 'График отключений'),
             style: TextStyle(
               color: c.text,
               fontSize: 16,
@@ -1094,7 +1220,7 @@ class _HomePageState extends State<HomePage> {
         ),
         Expanded(
           child: _ScheduleListView(
-            rows: _rows,
+            rows: rows,
             selectedQueue: _selectedQueue,
             currentIdx: currentIdx,
           ),
@@ -1112,7 +1238,8 @@ class _HomePageState extends State<HomePage> {
       return Padding(
         padding: EdgeInsets.fromLTRB(20, 40, 20, 0),
         child: Text(
-          'Графік на завтра ще не опубліковано',
+          tr('Графік на завтра ще не опубліковано',
+              'График на завтра ещё не опубликован'),
           textAlign: TextAlign.center,
           style: TextStyle(color: c.subtext, fontSize: 15),
         ),
@@ -1125,7 +1252,7 @@ class _HomePageState extends State<HomePage> {
         Padding(
           padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
           child: Text(
-            'Розклад на завтра',
+            tr('Розклад на завтра', 'График на завтра'),
             style: TextStyle(
               color: c.text,
               fontSize: 16,
@@ -1135,7 +1262,7 @@ class _HomePageState extends State<HomePage> {
         ),
         Expanded(
           child: _ScheduleListView(
-            rows: _tomorrowRows,
+            rows: _view(_tomorrowRows),
             selectedQueue: _selectedQueue,
             currentIdx: -1,
             highlightCurrent: false,
@@ -1241,7 +1368,8 @@ class _TimeCard extends StatelessWidget {
     final c = AppColors.of(context);
     final isLight = status == PowerStatus.light;
     final accent = isLight ? c.green : c.red;
-    final statusText = isLight ? 'Є світло' : 'Відключення';
+    final statusText =
+        isLight ? tr('Є світло', 'Есть свет') : tr('Відключення', 'Отключение');
     final statusIcon = isLight ? '💡' : '🚫';
 
     return Padding(
